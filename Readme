@@ -1,0 +1,21 @@
+# Simple PR Reviewer (Heuristic) · v0.1
+
+A tiny, deterministic reviewer that analyzes PR diffs and posts inline annotations via GitHub Actions logging commands.
+Useful as a baseline or to compare against any LLM reviewer (e.g., CodeRabbit).
+
+## What it checks
+- Large functions (line count threshold)
+- Suspicious debug prints (`console.log`, `print`, `puts`, `dbg!`)
+- `TODO`/`FIXME` left in code
+- Potential secrets in added lines (basic regexes)
+- New files without tests when `src/` changed
+- Dangerous patterns: `eval`, `new Function`, `child_process.exec`, `exec(` in Python, SQL `SELECT *`
+- Missing `types` in TS (very basic: `any` added)
+
+## How it works
+Workflow computes a diff for the PR (`base.sha..head.sha`) and pipes it to `tools/reviewer.js`.
+The script emits `::warning file=...,line=...,title=...::message` so GitHub renders them as annotations on the "Checks" tab.
+
+## Local run
+```bash
+git diff --unified=0 origin/main...HEAD | node tools/reviewer.js --stdin
