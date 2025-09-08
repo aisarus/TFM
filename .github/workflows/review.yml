@@ -1,4 +1,4 @@
-name: Simple PR Review (one-file)
+name: Simple PR Review (one-file + charts)
 
 on:
   pull_request:
@@ -25,87 +25,106 @@ jobs:
         run: |
           mkdir -p tools
           cat > tools/reviewer.js <<'JS'
-// Simple heuristic PR reviewer. Usage inside CI:
-//   git diff --unified=0 BASE HEAD > diff.patch
-//   node tools/reviewer.js --file diff.patch
 import fs from 'fs';
-
+// Parse args
 const args = process.argv.slice(2);
-const fileArgIndex = args.indexOf('--file');
-let diffText = '';
-if (fileArgIndex !== -1) {
-  diffText = fs.readFileSync(args[fileArgIndex + 1], 'utf8');
-} else {
-  try { diffText = fs.readFileSync(0, 'utf8'); } catch { /* noop */ }
-  if (!diffText) {
-    console.error('Provide --file <path> or pipe diff via stdin');
-    process.exit(2);
-  }
-}
+const idx = args.indexOf('--file');
+const statsPath = (()=>{const i=args.indexOf('--stats'); return i!==-1?args[i+1]:null})();
+let diffText = idx!==-1 ? fs.readFileSync(args[idx+1],'utf8') : (()=>{try{return fs.readFileSync(0,'utf8')}catch{return ''}})();
+if(!diffText){console.error('Provide --file <path> or pipe diff');process.exit(2)}
 
-function parseDiff(text) {
-  const files = [];
-  let current = null, newLineNum = null;
-  for (const line of text.split('\n')) {
-    if (line.startsWith('diff --git') || line.startsWith('--- ') || line.startsWith('+++ ')) {
-      if (line.startsWith('+++ b/')) {
-        const path = line.slice(6);
-        current = { path, hunks: [] };
-        files.push(current);
-      }
-      continue;
+// Diff → files/added lines
+function parseDiff(t){const files=[];let cur=null,n=null;
+  for(const line of t.split('\n')){
+    if(line.startsWith('diff --git')||line.startsWith('--- ')||line.startsWith('+++ ')){
+      if(line.startsWith('+++ b/')){cur={path:line.slice(6),hunks:[]};files.push(cur)}
+      continue
     }
-    if (line.startsWith('@@')) {
-      const m = /@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-      if (m) {
-        newLineNum = parseInt(m[1], 10);
-        current?.hunks.push({ start: newLineNum, lines: [] });
-      }
-      continue;
-    }
-    if (line.startsWith('+')) {
-      const content = line.slice(1);
-      current?.hunks[current.hunks.length - 1]?.lines.push({ n: newLineNum, content });
-      newLineNum++;
-      continue;
-    }
-    if (line.startsWith('-')) continue;
-    if (typeof newLineNum === 'number') newLineNum++;
-  }
-  return files;
+    if(line.startsWith('@@')){const m=/@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);if(m){n=parseInt(m[1],10);cur?.hunks.push({start:n,lines:[]})}continue}
+    if(line.startsWith('+')){const c=line.slice(1);cur?.hunks[cur.hunks.length-1]?.lines.push({n,content:c});n++;continue}
+    if(line.startsWith('-'))continue;
+    if(typeof n==='number')n++;
+  } return files;
 }
-
 const files = parseDiff(diffText);
 
-const secretsRegexes = [
-  {name:'AWS key', re: /AKIA[0-9A-Z]{16}/},
-  {name:'Generic token', re: /(token|apikey|api_key|secret)[\\s:=]+['"][A-Za-z0-9_\\-]{16,}['"]/i},
-  {name:'Private key', re: /-----BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY-----/}
-];
+// Rules
+const rules = {
+  debug:/\bconsole\.log\b|\bprint\s*\(|\bputs\b|dbg!\(/,
+  todo:/TODO|FIXME/,
+  dynamic:/\beval\b|new Function\s*\(|child_process\.exec\s*\(|\bexec\s*\(/,
+  starSelect:/SELECT\s+\*/i,
+  tsAny:/\bany\b/,
+  secretAWS:/AKIA[0-9A-Z]{16}/,
+  secretToken:/(token|apikey|api_key|secret)[\s:=]+['"][A-Za-z0-9_\-]{16,}['"]/i,
+  secretPriv:/-----BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY-----/
+};
 
-function warn(path, line, title, msg) {
-  const safe = msg.replace(/[\r\n]+/g, ' ').slice(0, 400);
-  console.log(`::warning file=${path},line=${line},title=${title}::${safe}`);
-}
+const counts = {debug:0,todo:0,dynamic:0,starSelect:0,tsAny:0,secrets:0,missingTests:0,totalWarnings:0};
+const warn=(p,l,t,m)=>{console.log(`::warning file=${p},line=${l},title=${t}::${m.replace(/[\r\n]+/g,' ').slice(0,400)}`);counts.totalWarnings++;};
 
-for (const f of files) {
-  const added = f.hunks.flatMap(h => h.lines);
-  for (const {n, content} of added) {
-    if (/\bconsole\.log\b|\bprint\s*\(|\bputs\b|dbg!\(/.test(content))
-      warn(f.path, n, 'Debug print left in code', 'Consider removing debug prints.');
-    if (/TODO|FIXME/.test(content))
-      warn(f.path, n, 'TODO/FIXME present', 'Resolve or ticket before merging.');
-    if (/\beval\b|new Function\s*\(|child_process\.exec\s*\(|\bexec\s*\(/.test(content))
-      warn(f.path, n, 'Dynamic execution detected', 'Avoid eval/exec unless strictly necessary.');
-    if (/SELECT\s+\*/i.test(content))
-      warn(f.path, n, 'SELECT * detected', 'Select explicit columns.');
-    if (/\bany\b/.test(content) && f.path.endsWith('.ts'))
-      warn(f.path, n, 'TypeScript any', 'Avoid using any; prefer explicit types.');
-    for (const s of secretsRegexes)
-      if (s.re.test(content))
-        warn(f.path, n, `Potential secret: ${s.name}`, 'Do not commit credentials or keys.');
+for(const f of files){
+  const isTS = f.path.endsWith('.ts');
+  for(const {n,content} of f.hunks.flatMap(h=>h.lines)){
+    if(rules.debug.test(content)){counts.debug++; warn(f.path,n,'Debug print left in code','Remove debug prints.')}
+    if(rules.todo.test(content)){counts.todo++; warn(f.path,n,'TODO/FIXME present','Resolve or ticket before merge.')}
+    if(rules.dynamic.test(content)){counts.dynamic++; warn(f.path,n,'Dynamic execution detected','Avoid eval/exec.')}
+    if(rules.starSelect.test(content)){counts.starSelect++; warn(f.path,n,'SELECT * detected','Select explicit columns.')}
+    if(isTS && rules.tsAny.test(content)){counts.tsAny++; warn(f.path,n,'TypeScript any','Prefer explicit types.')}
+    if(rules.secretAWS.test(content) || rules.secretToken.test(content) || rules.secretPriv.test(content)){
+      counts.secrets++; warn(f.path,n,'Potential secret','Do not commit credentials/keys.');
+    }
   }
 }
-// Extra: if src changed but no test file added in this diff.
-const changedSrc = files.filter(x => x.path.startsWith('src/')).length;
-const addedTests = files.filter(x => x.path.startsWith('test/
+const changedSrc = files.some(x=>x.path.startsWith('src/'));
+const addedTests = files.some(x=>x.path.startsWith('test/'));
+if(changedSrc && !addedTests){counts.missingTests++; warn('src/',1,'Missing tests for changed code','Changes in src/ without tests.')}
+
+// Save stats JSON
+if(statsPath){fs.writeFileSync(statsPath, JSON.stringify(counts, null, 2));}
+JS
+
+      - name: Compute diff
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          git fetch origin $BASE $HEAD --depth=1 || true
+          git diff --unified=0 $BASE $HEAD > diff.patch
+          echo "Diff lines: $(wc -l < diff.patch)"
+
+      - name: Run reviewer + collect stats
+        run: |
+          node tools/reviewer.js --file diff.patch --stats stats.json || true
+          echo "Stats:"; cat stats.json || true
+
+      - name: Job summary with diagrams (Mermaid)
+        env:
+          GH_STEP_SUMMARY: $GITHUB_STEP_SUMMARY
+        run: |
+          echo "## Heuristic Review Summary" >> "$GH_STEP_SUMMARY"
+          echo "" >> "$GH_STEP_SUMMARY"
+          echo "| Metric | Count |" >> "$GH_STEP_SUMMARY"
+          echo "|---|---:|" >> "$GH_STEP_SUMMARY"
+          for k in debug todo dynamic starSelect tsAny secrets missingTests totalWarnings; do
+            v=$(jq -r .${k} stats.json 2>/dev/null || echo 0)
+            echo "| $k | $v |" >> "$GH_STEP_SUMMARY"
+          done
+          echo "" >> "$GH_STEP_SUMMARY"
+          echo "### Issues by type" >> "$GH_STEP_SUMMARY"
+          echo "\`\`\`mermaid" >> "$GH_STEP_SUMMARY"
+          echo "pie title Issues by type" >> "$GH_STEP_SUMMARY"
+          for k in debug todo dynamic starSelect tsAny secrets; do
+            v=$(jq -r .${k} stats.json 2>/dev/null || echo 0)
+            echo "  \"$k\" : $v" >> "$GH_STEP_SUMMARY"
+          done
+          echo "\`\`\`" >> "$GH_STEP_SUMMARY"
+          echo "" >> "$GH_STEP_SUMMARY"
+          echo "### Pipeline overview" >> "$GH_STEP_SUMMARY"
+          echo "\`\`\`mermaid" >> "$GH_STEP_SUMMARY"
+          echo "flowchart LR" >> "$GH_STEP_SUMMARY"
+          echo "  A[PR opened/updated] --> B[Checkout & diff]" >> "$GH_STEP_SUMMARY"
+          echo "  B --> C[Heuristic review]" >> "$GH_STEP_SUMMARY"
+          echo "  C --> D{Findings}" >> "$GH_STEP_SUMMARY"
+          echo "  D -->|warnings| E[GitHub Annotations]" >> "$GH_STEP_SUMMARY"
+          echo "  D -->|stats.json| F[Summary Charts]" >> "$GH_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GH_STEP_SUMMARY"
