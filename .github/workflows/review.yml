@@ -1,4 +1,4 @@
-name: Simple PR Review (one-file + charts)
+name: Simple PR Review (stable)
 
 on:
   pull_request:
@@ -21,110 +21,82 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Write heuristic reviewer (tools/reviewer.js)
-        run: |
-          mkdir -p tools
-          cat > tools/reviewer.js <<'JS'
-import fs from 'fs';
-// Parse args
-const args = process.argv.slice(2);
-const idx = args.indexOf('--file');
-const statsPath = (()=>{const i=args.indexOf('--stats'); return i!==-1?args[i+1]:null})();
-let diffText = idx!==-1 ? fs.readFileSync(args[idx+1],'utf8') : (()=>{try{return fs.readFileSync(0,'utf8')}catch{return ''}})();
-if(!diffText){console.error('Provide --file <path> or pipe diff');process.exit(2)}
-
-// Diff → files/added lines
-function parseDiff(t){const files=[];let cur=null,n=null;
-  for(const line of t.split('\n')){
-    if(line.startsWith('diff --git')||line.startsWith('--- ')||line.startsWith('+++ ')){
-      if(line.startsWith('+++ b/')){cur={path:line.slice(6),hunks:[]};files.push(cur)}
-      continue
-    }
-    if(line.startsWith('@@')){const m=/@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);if(m){n=parseInt(m[1],10);cur?.hunks.push({start:n,lines:[]})}continue}
-    if(line.startsWith('+')){const c=line.slice(1);cur?.hunks[cur.hunks.length-1]?.lines.push({n,content:c});n++;continue}
-    if(line.startsWith('-'))continue;
-    if(typeof n==='number')n++;
-  } return files;
-}
-const files = parseDiff(diffText);
-
-// Rules
-const rules = {
-  debug:/\bconsole\.log\b|\bprint\s*\(|\bputs\b|dbg!\(/,
-  todo:/TODO|FIXME/,
-  dynamic:/\beval\b|new Function\s*\(|child_process\.exec\s*\(|\bexec\s*\(/,
-  starSelect:/SELECT\s+\*/i,
-  tsAny:/\bany\b/,
-  secretAWS:/AKIA[0-9A-Z]{16}/,
-  secretToken:/(token|apikey|api_key|secret)[\s:=]+['"][A-Za-z0-9_\-]{16,}['"]/i,
-  secretPriv:/-----BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY-----/
-};
-
-const counts = {debug:0,todo:0,dynamic:0,starSelect:0,tsAny:0,secrets:0,missingTests:0,totalWarnings:0};
-const warn=(p,l,t,m)=>{console.log(`::warning file=${p},line=${l},title=${t}::${m.replace(/[\r\n]+/g,' ').slice(0,400)}`);counts.totalWarnings++;};
-
-for(const f of files){
-  const isTS = f.path.endsWith('.ts');
-  for(const {n,content} of f.hunks.flatMap(h=>h.lines)){
-    if(rules.debug.test(content)){counts.debug++; warn(f.path,n,'Debug print left in code','Remove debug prints.')}
-    if(rules.todo.test(content)){counts.todo++; warn(f.path,n,'TODO/FIXME present','Resolve or ticket before merge.')}
-    if(rules.dynamic.test(content)){counts.dynamic++; warn(f.path,n,'Dynamic execution detected','Avoid eval/exec.')}
-    if(rules.starSelect.test(content)){counts.starSelect++; warn(f.path,n,'SELECT * detected','Select explicit columns.')}
-    if(isTS && rules.tsAny.test(content)){counts.tsAny++; warn(f.path,n,'TypeScript any','Prefer explicit types.')}
-    if(rules.secretAWS.test(content) || rules.secretToken.test(content) || rules.secretPriv.test(content)){
-      counts.secrets++; warn(f.path,n,'Potential secret','Do not commit credentials/keys.');
-    }
-  }
-}
-const changedSrc = files.some(x=>x.path.startsWith('src/'));
-const addedTests = files.some(x=>x.path.startsWith('test/'));
-if(changedSrc && !addedTests){counts.missingTests++; warn('src/',1,'Missing tests for changed code','Changes in src/ without tests.')}
-
-// Save stats JSON
-if(statsPath){fs.writeFileSync(statsPath, JSON.stringify(counts, null, 2));}
-JS
-
       - name: Compute diff
         run: |
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.event.pull_request.head.sha }}
           git fetch origin $BASE $HEAD --depth=1 || true
           git diff --unified=0 $BASE $HEAD > diff.patch
-          echo "Diff lines: $(wc -l < diff.patch)"
+          wc -l diff.patch || true
 
-      - name: Run reviewer + collect stats
+      - name: Write reviewer (CommonJS) and run
         run: |
-          node tools/reviewer.js --file diff.patch --stats stats.json || true
-          echo "Stats:"; cat stats.json || true
+          mkdir -p tools
+          cat > tools/reviewer.js <<'JS'
+const fs = require('fs');
+const args = process.argv.slice(2);
+const i = args.indexOf('--file');
+let diff = i !== -1 ? fs.readFileSync(args[i+1],'utf8') : '';
+if (!diff) { try { diff = fs.readFileSync(0,'utf8'); } catch {}
+  if (!diff) { console.error('no diff'); process.exit(0); }
+}
+function parseDiff(t){
+  const files=[]; let cur=null, n=null;
+  for (const line of t.split('\n')){
+    if (line.startsWith('diff --git') || line.startsWith('--- ') || line.startsWith('+++ ')){
+      if (line.startsWith('+++ b/')) { cur = { path: line.slice(6), hunks: [] }; files.push(cur); }
+      continue;
+    }
+    if (line.startsWith('@@')) { const m=/@@ -\d+(?:,\d+)? \+(\d+)/.exec(line); if (m){ n=+m[1]; cur && cur.hunks.push({start:n,lines:[]}); } continue; }
+    if (line.startsWith('+')) { const c=line.slice(1); cur && cur.hunks[cur.hunks.length-1] && cur.hunks[cur.hunks.length-1].lines.push({n,content:c}); n++; continue; }
+    if (line.startsWith('-')) continue;
+    if (typeof n==='number') n++;
+  } return files;
+}
+const files = parseDiff(diff);
+const R = {
+  debug: /\bconsole\.log\b|\bprint\s*\(|\bputs\b|dbg!\(/,
+  todo: /TODO|FIXME/,
+  dyn: /\beval\b|new Function\s*\(|child_process\.exec\s*\(|\bexec\s*\(/,
+  star: /SELECT\s+\*/i,
+  any: /\bany\b/,
+  aws: /AKIA[0-9A-Z]{16}/,
+  tok: /(token|apikey|api_key|secret)[\s:=]+['"][A-Za-z0-9_\-]{16,}['"]/i,
+  priv: /-----BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY-----/
+};
+const S = { debug:0,todo:0,dynamic:0,starSelect:0,tsAny:0,secrets:0,missingTests:0,totalWarnings:0 };
+const warn = (p,l,t,m)=>{ console.log(`::warning file=${p},line=${l},title=${t}::${m.replace(/[\r\n]+/g,' ').slice(0,400)}`); S.totalWarnings++; };
 
-      - name: Job summary with diagrams (Mermaid)
-        env:
-          GH_STEP_SUMMARY: $GITHUB_STEP_SUMMARY
+for (const f of files){
+  const ts = f.path.endsWith('.ts');
+  const added = f.hunks.flatMap(h=>h.lines||[]);
+  for (const {n,content} of added){
+    if (R.debug.test(content)) { S.debug++; warn(f.path,n,'Debug print','Remove debug prints.'); }
+    if (R.todo.test(content)) { S.todo++; warn(f.path,n,'TODO/FIXME','Resolve or ticket.'); }
+    if (R.dyn.test(content)) { S.dynamic++; warn(f.path,n,'Dynamic execution','Avoid eval/exec.'); }
+    if (R.star.test(content)) { S.starSelect++; warn(f.path,n,'SELECT *','Select explicit columns.'); }
+    if (ts && R.any.test(content)) { S.tsAny++; warn(f.path,n,'TypeScript any','Prefer explicit types.'); }
+    if (R.aws.test(content) || R.tok.test(content) || R.priv.test(content)) { S.secrets++; warn(f.path,n,'Potential secret','Do not commit credentials.'); }
+  }
+}
+const changedSrc = files.some(x=>x.path.startsWith('src/'));
+const addedTests = files.some(x=>x.path.startsWith('test/'));
+if (changedSrc && !addedTests) { S.missingTests++; warn('src/',1,'Missing tests','Changes in src/ without tests.'); }
+fs.writeFileSync('stats.json', JSON.stringify(S));
+JS
+          node tools/reviewer.js --file diff.patch || true
+          test -f stats.json || echo '{"debug":0,"todo":0,"dynamic":0,"starSelect":0,"tsAny":0,"secrets":0,"missingTests":0,"totalWarnings":0}' > stats.json
+
+      - name: Write Summary (pie + flowchart + ASCII bar)
         run: |
-          echo "## Heuristic Review Summary" >> "$GH_STEP_SUMMARY"
-          echo "" >> "$GH_STEP_SUMMARY"
-          echo "| Metric | Count |" >> "$GH_STEP_SUMMARY"
-          echo "|---|---:|" >> "$GH_STEP_SUMMARY"
-          for k in debug todo dynamic starSelect tsAny secrets missingTests totalWarnings; do
-            v=$(jq -r .${k} stats.json 2>/dev/null || echo 0)
-            echo "| $k | $v |" >> "$GH_STEP_SUMMARY"
-          done
-          echo "" >> "$GH_STEP_SUMMARY"
-          echo "### Issues by type" >> "$GH_STEP_SUMMARY"
-          echo "\`\`\`mermaid" >> "$GH_STEP_SUMMARY"
-          echo "pie title Issues by type" >> "$GH_STEP_SUMMARY"
-          for k in debug todo dynamic starSelect tsAny secrets; do
-            v=$(jq -r .${k} stats.json 2>/dev/null || echo 0)
-            echo "  \"$k\" : $v" >> "$GH_STEP_SUMMARY"
-          done
-          echo "\`\`\`" >> "$GH_STEP_SUMMARY"
-          echo "" >> "$GH_STEP_SUMMARY"
-          echo "### Pipeline overview" >> "$GH_STEP_SUMMARY"
-          echo "\`\`\`mermaid" >> "$GH_STEP_SUMMARY"
-          echo "flowchart LR" >> "$GH_STEP_SUMMARY"
-          echo "  A[PR opened/updated] --> B[Checkout & diff]" >> "$GH_STEP_SUMMARY"
-          echo "  B --> C[Heuristic review]" >> "$GH_STEP_SUMMARY"
-          echo "  C --> D{Findings}" >> "$GH_STEP_SUMMARY"
-          echo "  D -->|warnings| E[GitHub Annotations]" >> "$GH_STEP_SUMMARY"
-          echo "  D -->|stats.json| F[Summary Charts]" >> "$GH_STEP_SUMMARY"
-          echo "\`\`\`" >> "$GH_STEP_SUMMARY"
+          node - <<'JS'
+          const fs=require('fs'); const s=JSON.parse(fs.readFileSync('stats.json','utf8'));
+          const keys=["debug","todo","dynamic","starSelect","tsAny","secrets"]; const sum=keys.reduce((a,k)=>a+(+s[k]||0),0);
+          const bar=k=>'█'.repeat(Math.min(30, Math.round(((+s[k]||0)/(sum||1))*30)));
+          let md="## Heuristic Review Summary\n\n| Metric | Count |\n|---|---:|\n";
+          for(const k of [...keys,"missingTests","totalWarnings"]) md+=`| ${k} | ${s[k]||0} |\n`;
+          md+="\n### ASCII bar chart\n"; for(const k of keys) md+=`- ${k.padEnd(12)} ${bar(k)} ${s[k]||0}\n`;
+          md+="\n### Issues by type\n```mermaid\npie title Issues by type\n"; for(const k of keys) md+=`  "${k}" : ${s[k]||0}\n`;
+          md+="```\n\n### Pipeline overview\n```mermaid\nflowchart LR\n  A[PR opened/updated] --> B[Checkout & diff]\n  B --> C[Heuristic review]\n  C --> D{Findings}\n  D -->|warnings| E[Annotations]\n  D -->|stats.json| F[Summary Charts]\n```\n";
+          fs.writeFileSync(process.env.GITHUB_STEP_SUMMARY, md);
+          JS
