@@ -1,0 +1,111 @@
+name: Simple PR Review (one-file)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Write heuristic reviewer (tools/reviewer.js)
+        run: |
+          mkdir -p tools
+          cat > tools/reviewer.js <<'JS'
+// Simple heuristic PR reviewer. Usage inside CI:
+//   git diff --unified=0 BASE HEAD > diff.patch
+//   node tools/reviewer.js --file diff.patch
+import fs from 'fs';
+
+const args = process.argv.slice(2);
+const fileArgIndex = args.indexOf('--file');
+let diffText = '';
+if (fileArgIndex !== -1) {
+  diffText = fs.readFileSync(args[fileArgIndex + 1], 'utf8');
+} else {
+  try { diffText = fs.readFileSync(0, 'utf8'); } catch { /* noop */ }
+  if (!diffText) {
+    console.error('Provide --file <path> or pipe diff via stdin');
+    process.exit(2);
+  }
+}
+
+function parseDiff(text) {
+  const files = [];
+  let current = null, newLineNum = null;
+  for (const line of text.split('\n')) {
+    if (line.startsWith('diff --git') || line.startsWith('--- ') || line.startsWith('+++ ')) {
+      if (line.startsWith('+++ b/')) {
+        const path = line.slice(6);
+        current = { path, hunks: [] };
+        files.push(current);
+      }
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      const m = /@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (m) {
+        newLineNum = parseInt(m[1], 10);
+        current?.hunks.push({ start: newLineNum, lines: [] });
+      }
+      continue;
+    }
+    if (line.startsWith('+')) {
+      const content = line.slice(1);
+      current?.hunks[current.hunks.length - 1]?.lines.push({ n: newLineNum, content });
+      newLineNum++;
+      continue;
+    }
+    if (line.startsWith('-')) continue;
+    if (typeof newLineNum === 'number') newLineNum++;
+  }
+  return files;
+}
+
+const files = parseDiff(diffText);
+
+const secretsRegexes = [
+  {name:'AWS key', re: /AKIA[0-9A-Z]{16}/},
+  {name:'Generic token', re: /(token|apikey|api_key|secret)[\\s:=]+['"][A-Za-z0-9_\\-]{16,}['"]/i},
+  {name:'Private key', re: /-----BEGIN (?:RSA|OPENSSH|EC) PRIVATE KEY-----/}
+];
+
+function warn(path, line, title, msg) {
+  const safe = msg.replace(/[\r\n]+/g, ' ').slice(0, 400);
+  console.log(`::warning file=${path},line=${line},title=${title}::${safe}`);
+}
+
+for (const f of files) {
+  const added = f.hunks.flatMap(h => h.lines);
+  for (const {n, content} of added) {
+    if (/\bconsole\.log\b|\bprint\s*\(|\bputs\b|dbg!\(/.test(content))
+      warn(f.path, n, 'Debug print left in code', 'Consider removing debug prints.');
+    if (/TODO|FIXME/.test(content))
+      warn(f.path, n, 'TODO/FIXME present', 'Resolve or ticket before merging.');
+    if (/\beval\b|new Function\s*\(|child_process\.exec\s*\(|\bexec\s*\(/.test(content))
+      warn(f.path, n, 'Dynamic execution detected', 'Avoid eval/exec unless strictly necessary.');
+    if (/SELECT\s+\*/i.test(content))
+      warn(f.path, n, 'SELECT * detected', 'Select explicit columns.');
+    if (/\bany\b/.test(content) && f.path.endsWith('.ts'))
+      warn(f.path, n, 'TypeScript any', 'Avoid using any; prefer explicit types.');
+    for (const s of secretsRegexes)
+      if (s.re.test(content))
+        warn(f.path, n, `Potential secret: ${s.name}`, 'Do not commit credentials or keys.');
+  }
+}
+// Extra: if src changed but no test file added in this diff.
+const changedSrc = files.filter(x => x.path.startsWith('src/')).length;
+const addedTests = files.filter(x => x.path.startsWith('test/
